@@ -1664,28 +1664,31 @@ end
 Base.reducedim_initarray(A::SparseVectorUnion, region, v0, ::Type{R}) where {R} =
     fill!(Array{R}(undef, Base.to_shape(Base.reduced_indices(A, region))), v0)
 
-function Base._mapreduce(f, op, ::IndexCartesian, A::SparseVectorUnion)
+function Base._mapreduce(f, op, ::IndexCartesian, A::SparseVectorUnion, init)
     T = eltype(A)
-    isempty(A) && return Base.mapreduce_empty(f, op, T)
+    isempty(A) && return Base._mapreduce_start(f, op, A, init)
+    length(A) == 1 && return Base._mapreduce_start(f, op, A, init, first(A))
     z = nnz(A)
     rest, ini = if z == 0
-        length(A)-z-1, f(zero(T))
+        length(A)-z-1, Base._mapreduce_start(f, op, A, init, zero(T))
+    elseif z == 1
+        length(A)-z-1, Base._mapreduce_start(f, op, A, init, first(nonzeros(A)), zero(T))
     else
-        length(A)-z, Base.mapreduce_impl(f, op, nonzeros(A), 1, z)
+        length(A)-z, Base.mapreduce_impl(f, op, nonzeros(A), init, 1, z)
     end
     _mapreducezeros(f, op, T, rest, ini)
 end
 
 Base._any(f, A::SparseVectorUnion, ::Colon) =
-    iszero(length(A)) ? false : Base._mapreduce(f, |, IndexCartesian(), A)
+    iszero(length(A)) ? false : Base._mapreduce(f, |, IndexCartesian(), A, false)
 Base._all(f, A::SparseVectorUnion, ::Colon) =
-    iszero(length(A)) ? true  : Base._mapreduce(f, &, IndexCartesian(), A)
+    iszero(length(A)) ? true  : Base._mapreduce(f, &, IndexCartesian(), A, true)
 
 function Base.mapreducedim!(f, op, R::AbstractVector, A::SparseVectorUnion)
     # dim1 reduction could be safely replaced with a mapreduce
     if length(R) == 1
         I = firstindex(R)
-        v = Base._mapreduce(f, op, IndexCartesian(), A)
+        v = Base._mapreduce(f, op, IndexCartesian(), A, Base._InitialValue())
         R[I] = op(R[I], v)
         return R
     end

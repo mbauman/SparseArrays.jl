@@ -2413,17 +2413,17 @@ function _mapreducezeros(f, op, ::Type{T}, nzeros::Integer, v0) where T
     v
 end
 
-function Base._mapreduce(f, op, ::Base.IndexCartesian, A::AbstractSparseMatrixCSC{T}) where T
+function Base._mapreduce(f, op, ::Base.IndexCartesian, A::AbstractSparseMatrixCSC{T}, init) where T
     z = nnz(A)
     n = widelength(A)
     if z == 0
         if n == 0
-            Base.mapreduce_empty(f, op, T)
+            Base._mapreduce_start(f, op, A, init)
         else
-            _mapreducezeros(f, op, T, n-z-1, f(zero(T)))
+            _mapreducezeros(f, op, T, n-z-1, Base._mapreduce_start(f, op, A, init, zero(T)))
         end
     else
-        _mapreducezeros(f, op, T, n-z, Base._mapreduce(f, op, nzvalview(A)))
+        _mapreducezeros(f, op, T, n-z, Base._mapreduce(f, op, nzvalview(A), init))
     end
 end
 
@@ -2439,20 +2439,22 @@ _mapreducezeros(f::Base.ExtremaMap, op::typeof(Base._extrema_rf), ::Type{T}, nze
 
 # Specialized mapreduce for any and all
 Base._any(f, A::AbstractSparseMatrixCSC, ::Colon) =
-    iszero(widelength(A)) ? false : Base._mapreduce(f, |, IndexCartesian(), A)
+    iszero(widelength(A)) ? false : Base._mapreduce(f, |, IndexCartesian(), A, false)
 Base._all(f, A::AbstractSparseMatrixCSC, ::Colon) =
-    iszero(widelength(A)) ? true  : Base._mapreduce(f, &, IndexCartesian(), A)
+    iszero(widelength(A)) ? true  : Base._mapreduce(f, &, IndexCartesian(), A, true)
 
-function Base._mapreduce(f, op::Union{typeof(Base.mul_prod),typeof(*)}, ::Base.IndexCartesian, A::AbstractSparseMatrixCSC{T}) where T
+function Base._mapreduce(f, op::Union{typeof(Base.mul_prod),typeof(*)}, ::Base.IndexCartesian, A::AbstractSparseMatrixCSC{T}, init) where T
     nnzA = nnz(A)
     nzeros = widelength(A) - nnzA
     if nzeros == 0
         # No zeros, so don't compute f(0) since it might throw
-        Base._mapreduce(f, op, nzvalview(A))
+        Base._mapreduce(f, op, nzvalview(A), init)
     else
-        v = f(zero(T))^(nzeros)
+        # Optimize the repeated multiplication as exponentiation; this technically breaks
+        # the documentation: "elements are not reordered if you use an ordered collection"
+        v = Base._mapreduce_start(f, op, A, init, zero(T))^(nzeros)
         # Bail out early if initial reduction value is zero or if there are no stored elements
-        (_iszero(v) || nnzA == 0) ? v : v*Base._mapreduce(f, op, nzvalview(A))
+        (_iszero(v) || nnzA == 0) ? v : op(v, Base._mapreduce(f, op, nzvalview(A), init))
     end
 end
 
