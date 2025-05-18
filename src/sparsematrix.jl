@@ -2412,319 +2412,107 @@ function _mapreducezeros(f, op, ::Type{T}, nzeros::Integer, v0) where T
     v
 end
 
-function Base._mapreduce(f, op, ::Base.IndexCartesian, A::AbstractSparseMatrixCSC{T}) where T
-    z = nnz(A)
-    n = widelength(A)
-    if z == 0
-        if n == 0
-            Base.mapreduce_empty(f, op, T)
-        else
-            _mapreducezeros(f, op, T, n-z-1, f(zero(T)))
-        end
-    else
-        _mapreducezeros(f, op, T, n-z, Base._mapreduce(f, op, nzvalview(A)))
-    end
-end
-
 # Specialized mapreduce for +/*/min/max/_extrema_rf
 _mapreducezeros(f, op::Union{typeof(Base.add_sum),typeof(+)}, ::Type{T}, nzeros::Integer, v0) where {T} =
-    nzeros == 0 ? op(zero(v0), v0) : op(f(zero(T))*nzeros, v0)
+    nzeros == 0 ? op(v0, zero(v0)) : op(v0, f(zero(T))*nzeros)
 _mapreducezeros(f, op::Union{typeof(Base.mul_prod),typeof(*)},::Type{T}, nzeros::Integer, v0) where {T} =
-    nzeros == 0 ? op(one(v0), v0) : op(f(zero(T))^nzeros, v0)
+    nzeros == 0 ? op(v0, one(v0)) : op(v0, f(zero(T))^nzeros)
 _mapreducezeros(f, op::Union{typeof(min),typeof(max)}, ::Type{T}, nzeros::Integer, v0) where {T} =
     nzeros == 0 ? v0 : op(v0, f(zero(T)))
 _mapreducezeros(f::Base.ExtremaMap, op::typeof(Base._extrema_rf), ::Type{T}, nzeros::Integer, v0) where {T} =
     nzeros == 0 ? v0 : op(v0, f(zero(T)))
 
-# Specialized mapreduce for any and all
-Base._any(f, A::AbstractSparseMatrixCSC, ::Colon) =
-    iszero(widelength(A)) ? false : Base._mapreduce(f, |, IndexCartesian(), A)
-Base._all(f, A::AbstractSparseMatrixCSC, ::Colon) =
-    iszero(widelength(A)) ? true  : Base._mapreduce(f, &, IndexCartesian(), A)
-
-function Base._mapreduce(f, op::Union{typeof(Base.mul_prod),typeof(*)}, ::Base.IndexCartesian, A::AbstractSparseMatrixCSC{T}) where T
-    nnzA = nnz(A)
-    nzeros = widelength(A) - nnzA
-    if nzeros == 0
-        # No zeros, so don't compute f(0) since it might throw
-        Base._mapreduce(f, op, nzvalview(A))
-    else
-        v = f(zero(T))^(nzeros)
-        # Bail out early if initial reduction value is zero or if there are no stored elements
-        (_iszero(v) || nnzA == 0) ? v : v*Base._mapreduce(f, op, nzvalview(A))
+using Base.PermutedDimsArrays: CommutativeOps
+function Base.mapreduce_kernel(f, op::CommutativeOps, A::AbstractSparseMatrixCSC{T}, init, inds::CartesianIndices{2}) where {T}
+    z = nnz(A)
+    n = widelength(A)
+    if z == 0
+        return _mapreducezeros(f, op, T, n-1, Base._mapreduce_start(f, op, A, init, zero(T)))
+    elseif inds == CartesianIndices(A)
+        return _mapreducezeros(f, op, T, n-z, mapreduce(f, op, nzvalview(A); init))
     end
-end
-
-# General mapreducedim
-function _mapreducerows!(f, op, R::AbstractArray, A::AbstractSparseMatrixCSC{T}) where T
-    require_one_based_indexing(A, R)
-    colptr = getcolptr(A)
+    rows, cols = inds.indices
     rowval = rowvals(A)
-    nzval = nonzeros(A)
-    m, n = size(A)
-    @inbounds for col in axes(A,2)
-        r = R[1, col]
-        @simd for j = colptr[col]:colptr[col+1]-1
+    colptr = getcolptr(A)
+    nzval = getnzval(A)
+    m = length(rows)
+    r = Base._mapreduce_start(f, op, A, init, A[first(inds)])
+    # @info "$inds"
+    # @info "$((first(inds).I...,))"
+    if m != size(A, 1)
+        # We need to constrain our column indexing by the given rows
+        for col in cols
+            js = colptr[col]:colptr[col+1]-1
+            j1 = searchsortedfirst(view(rowval, js), first(rows) + (col == first(cols)))
+            jN = searchsortedlast(view(rowval, js[j1:end]), last(rows))
+            for j in js[j1:j1+jN-1]
+                # @info "($(rowval[j]), $col)"
+                r = op(r, f(nzval[j]))
+            end
+            # @info "($(rowval[js[end]]), $col) $(m-jN-(col==first(cols))) zeros following"
+            r = _mapreducezeros(f, op, T, m-jN-(col==first(cols)), r)
+        end
+    else
+        # It's not as easy to skip that first row for the first column; peel it out here:
+        col1 = first(cols)
+        j1 = colptr[col1]
+        m1 = m-1
+        if rowval[j1] == first(rows)
+            j1 += 1
+        end
+        for j in j1:colptr[col1+1]-1
+            # @info "($(rowval[j]), $col1)"
             r = op(r, f(nzval[j]))
         end
-        R[1, col] = _mapreducezeros(f, op, T, m-(colptr[col+1]-colptr[col]), r)
+        # @info "(:, $col1) $(m1-(colptr[col1+1]-j1)) zeros intermingled"
+        r = _mapreducezeros(f, op, T, m1-(colptr[col1+1]-j1), r)
+
+        for col in cols[begin+1:end]
+            for j in colptr[col]:colptr[col+1]-1
+                # @info "($(rowval[j]), $col)"
+                r = op(r, f(nzval[j]))
+            end
+            # @info "(:, $col) $(m-(colptr[col+1]-colptr[col])) zeros intermingled"
+            r = _mapreducezeros(f, op, T, m-(colptr[col+1]-colptr[col]), r)
+        end
     end
-    R
+    return r
 end
 
-function _mapreducecols!(f, op, R::AbstractArray, A::AbstractSparseMatrixCSC{Tv,Ti}) where {Tv,Ti}
-    require_one_based_indexing(A, R)
-    colptr = getcolptr(A)
+function Base.mapreduce_kernel(f, op, A::AbstractSparseMatrixCSC{T}, init, inds::CartesianIndices{2}) where {T}
+    if nnz(A) == 0
+        n = widelength(A)
+        return _mapreducezeros(f, op, T, n-1, Base._mapreduce_start(f, op, A, init, zero(T)))
+    end
+    rows, cols = inds.indices
     rowval = rowvals(A)
-    nzval = nonzeros(A)
-    m, n = size(A)
-    rownz = fill(convert(Ti, n), m)
-    @inbounds for col in axes(A,2)
-        @simd for j = colptr[col]:colptr[col+1]-1
-            row = rowval[j]
-            R[row, 1] = op(R[row, 1], f(nzval[j]))
-            rownz[row] -= 1
-        end
-    end
-    @inbounds for i = 1:m
-        R[i, 1] = _mapreducezeros(f, op, Tv, Int(rownz[i]), R[i, 1])
-    end
-    R
-end
-
-function Base._mapreducedim!(f, op, R::AbstractArray, A::AbstractSparseMatrixCSC{T}) where T
-    require_one_based_indexing(A, R)
-    lsiz = Base.check_reducedims(R,A)
-    isempty(A) && return R
-
-    if size(R, 1) == size(R, 2) == 1
-        # Reduction along both columns and rows
-        R[1, 1] = op(R[1, 1], mapreduce(f, op, A))
-    elseif size(R, 1) == 1
-        # Reduction along rows
-        _mapreducerows!(f, op, R, A)
-    elseif size(R, 2) == 1
-        # Reduction along columns
-        _mapreducecols!(f, op, R, A)
-    else
-        # Reduction along a dimension > 2
-        # Compute op(R, f(A))
-        m, n = size(A)
-        nzval = nonzeros(A)
-        if length(nzval) == m*n
-            # No zeros, so don't compute f(0) since it might throw
-            for col in axes(A,2)
-                @simd for row in axes(A,1)
-                    @inbounds R[row, col] = op(R[row, col], f(nzval[(col-1)*m+row]))
-                end
-            end
-        else
-            colptr = getcolptr(A)
-            rowval = rowvals(A)
-            zeroval = f(zero(T))
-            @inbounds for col in axes(A,2)
-                lastrow = 0
-                for j = colptr[col]:colptr[col+1]-1
-                    row = rowval[j]
-                    @simd for i = lastrow+1:row-1 # Zeros before this nonzero
-                        R[i, col] = op(R[i, col], zeroval)
-                    end
-                    R[row, col] = op(R[row, col], f(nzval[j]))
-                    lastrow = row
-                end
-                @simd for i = lastrow+1:m         # Zeros at end
-                    R[i, col] = op(R[i, col], zeroval)
-                end
-            end
-        end
-    end
-    R
-end
-
-# Specialized mapreducedim for + cols to avoid allocating a
-# temporary array when f(0) == 0
-function _mapreducecols!(f, op::typeof(+), R::AbstractArray, A::AbstractSparseMatrixCSC{Tv,Ti}) where {Tv,Ti}
-    require_one_based_indexing(A, R)
-    nzval = nonzeros(A)
-    m, n = size(A)
-    if length(nzval) == m*n
-        # No zeros, so don't compute f(0) since it might throw
-        for col in axes(A,2)
-            @simd for row in axes(A,1)
-                @inbounds R[row, 1] = op(R[row, 1], f(nzval[(col-1)*m+row]))
-            end
-        end
-    else
-        colptr = getcolptr(A)
-        rowval = rowvals(A)
-        zeroval = f(zero(Tv))
-        if isequal(zeroval, zero(Tv))
-            # Case where f(0) == 0
-            @inbounds for col in axes(A,2)
-                @simd for j = colptr[col]:colptr[col+1]-1
-                    R[rowval[j], 1] += f(nzval[j])
-                end
-            end
-        else
-            # Case where f(0) != 0
-            rownz = fill(convert(Ti, n), m)
-            @inbounds for col in axes(A,2)
-                @simd for j = colptr[col]:colptr[col+1]-1
-                    row = rowval[j]
-                    R[row, 1] += f(nzval[j])
-                    rownz[row] -= 1
-                end
-            end
-            for i = 1:m
-                R[i, 1] += rownz[i]*zeroval
-            end
-        end
-    end
-    R
-end
-
-# any(pred, A, dims = 1) => mapreduce(pred, |, A, dims = 1)
-# final argument `post` is to allow post-mapping each columnar mapreduce
-function _mapreducerows!(pred::P, ::typeof(|), R::AbstractMatrix{Bool}, A::AbstractSparseMatrixCSC{Tv},
-                         post::F = identity) where {P, F, Tv}
-    nzval = nonzeros(A)
     colptr = getcolptr(A)
-    m, n = size(A)
-    @inbounds for ii in axes(A,2)
-        bi, ei = colptr[ii], colptr[ii+1]
-        len = ei - bi
-        # An empty column is trivial
-        if len == 0
-            R[1, ii] = post(pred(zero(Tv)))
-            continue
+    nzval = getnzval(A)
+    m = length(rows)
+    r = Base._mapreduce_start(f, op, A, init, A[first(inds)])
+    # @info "$inds"
+    # @info "$((first(inds).I...,))"
+    for col in cols
+        js = colptr[col]:colptr[col+1]-1
+        j1 = searchsortedfirst(view(rowval, js), first(rows) + (col == first(cols)))
+        jN = searchsortedlast(view(rowval, js[j1:end]), last(rows))
+        row = first(rows) - 1 + (col==first(cols))
+        for j in js[j1:j1+jN-1]
+            row, prev_stored_row = rowval[j], row
+            if row > prev_stored_row+1
+                # @info "($row, $col) $(row-prev_stored_row-1) zeros preceeding"
+                r = _mapreducezeros(f, op, T, row-prev_stored_row-1, r)
+            end
+            # @info "($row, $col)"
+            r = op(r, f(nzval[j]))
         end
-        # If predicate on zero is true, then sparse column can be short-circuited
-        if pred(zero(Tv)) && len < m
-            R[1, ii] = post(true)
-            continue
+        if last(rows) > row
+            # @info "($(row), $col) $(m-jN) zeros following"
+            r = _mapreducezeros(f, op, T, m-jN, r)
         end
-        # Otherwise reduce over the stored values
-        r = false
-        for jj in bi:(ei - 1)
-            r = pred(nzval[jj])
-            r && break
-        end
-        R[1, ii] = post(r)
     end
-    return R
+    return r
 end
-# all(pred, A, dims = 1) => mapreduce(pred, &, A, dims = 1) == .!mapreduce(!pred, |, A, dims = 1)
-_mapreducerows!(pred::P, ::typeof(&), R::AbstractMatrix{Bool},
-                A::AbstractSparseMatrixCSC) where {P} = _mapreducerows!(!pred, |, R, A, !)
-
-# findmax/min and argmax/min methods
-# find first zero value in sparse matrix - return linear index in full matrix
-# non-structural zeros are identified by `iszero` in line with the sparse constructors.
-function _findz(A::AbstractSparseMatrixCSC{Tv,Ti}, rows=axes(A,1), cols=axes(A,2)) where {Tv,Ti}
-    colptr = getcolptr(A); rowval = rowvals(A); nzval = nonzeros(A)
-    row = 0
-    rowmin = rows[1]; rowmax = rows[end]
-    allrows = (rows == axes(A,1))
-    @inbounds for col in cols
-        r1::Int = colptr[col]
-        r2::Int = colptr[col+1] - 1
-        if !allrows && (r1 <= r2)
-            r1 += searchsortedfirst(view(rowval, r1:r2), rowmin) - 1
-            (r1 <= r2 ) && (r2 = searchsortedlast(view(rowval, r1:r2), rowmax) + r1 - 1)
-        end
-        row = rowmin
-        while (r1 <= r2) && (row == rowval[r1]) && _isnotzero(nzval[r1])
-            r1 += 1
-            row += 1
-        end
-        (row <= rowmax) && (return CartesianIndex(row, col))
-    end
-    return CartesianIndex(0, 0)
-end
-
-function _findr(op, A::AbstractSparseMatrixCSC{Tv}, region) where {Tv}
-    require_one_based_indexing(A)
-    Ti = eltype(keys(A))
-    i1 = first(keys(A))
-    N = nnz(A)
-    L = widelength(A)
-    if L == 0
-        throw(ArgumentError("reducing over an empty collection is not allowed"))
-    end
-
-    colptr = getcolptr(A); rowval = rowvals(A); nzval = nonzeros(A); m = size(A, 1); n = size(A, 2)
-    zval = zero(Tv)
-    szA = size(A)
-
-    if region == 1 || region == (1,)
-        (N == 0) && (return (fill(zval,1,n), fill(i1,1,n)))
-        S = Vector{Tv}(undef, n); I = Vector{Ti}(undef, n)
-        @inbounds for i = 1 : n
-            Sc = zval; Ic = _findz(A, 1:m, i:i)
-            if Ic == CartesianIndex(0, 0)
-                j = colptr[i]
-                Ic = CartesianIndex(rowval[j], i)
-                Sc = nzval[j]
-            end
-            for j = colptr[i] : colptr[i+1]-1
-                if op(nzval[j], Sc)
-                    Sc = nzval[j]
-                    Ic = CartesianIndex(rowval[j], i)
-                end
-            end
-            S[i] = Sc; I[i] = Ic
-        end
-        return(reshape(S,1,n), reshape(I,1,n))
-    elseif region == 2 || region == (2,)
-        (N == 0) && (return (fill(zval,m,1), fill(i1,m,1)))
-        S = Vector{Tv}(undef, m)
-        I = Vector{Ti}(undef, m)
-        @inbounds for row in 1:m
-            S[row] = zval; I[row] = _findz(A, row:row, 1:n)
-            if I[row] == CartesianIndex(0, 0)
-                I[row] = CartesianIndex(row, 1)
-                S[row] = A[row,1]
-            end
-        end
-        @inbounds for i = 1 : n, j = colptr[i] : colptr[i+1]-1
-            row = rowval[j]
-            if op(nzval[j], S[row])
-                S[row] = nzval[j]
-                I[row] = CartesianIndex(row, i)
-            end
-        end
-        return (reshape(S,m,1), reshape(I,m,1))
-    elseif region == (1,2)
-        (N == 0) && (return (fill(zval,1,1), fill(i1,1,1)))
-        hasz = nnz(A) != widelength(A)
-        Sv = hasz ? zval : nzval[1]
-        Iv::(Ti) = hasz ? _findz(A) : i1
-        @inbounds for i = 1 : size(A, 2), j = colptr[i] : (colptr[i+1]-1)
-            if op(nzval[j], Sv)
-                Sv = nzval[j]
-                Iv = CartesianIndex(rowval[j], i)
-            end
-        end
-        return (fill(Sv,1,1), fill(Iv,1,1))
-    else
-        throw(ArgumentError("invalid value for region; must be 1, 2, or (1,2)"))
-    end
-end
-
-_isless_fm(a, b)    =  b == b && ( a != a || isless(a, b) )
-_isgreater_fm(a, b) =  b == b && ( a != a || isless(b, a) )
-
-findmin(A::AbstractSparseMatrixCSC{Tv}, region::Union{Integer,Tuple{Integer},NTuple{2,Integer}}) where {Tv} =
-    _findr(_isless_fm, A, region)
-findmax(A::AbstractSparseMatrixCSC{Tv}, region::Union{Integer,Tuple{Integer},NTuple{2,Integer}}) where {Tv} =
-    _findr(_isgreater_fm, A, region)
-findmin(A::AbstractSparseMatrixCSC; dims::Union{Nothing,Integer,Tuple{Integer},NTuple{2,Integer}} = nothing) =
-    isnothing(dims) ? (r = findmin(A, (1,2)); (r[1][1], r[2][1])) : findmin(A, dims)
-findmax(A::AbstractSparseMatrixCSC; dims::Union{Nothing,Integer,Tuple{Integer},NTuple{2,Integer}} = nothing) =
-    isnothing(dims) ? (r = findmax(A, (1,2)); (r[1][1], r[2][1])) : findmax(A, dims)
-
-argmin(A::AbstractSparseMatrixCSC) = findmin(A)[2]
-argmax(A::AbstractSparseMatrixCSC) = findmax(A)[2]
 
 ## getindex
 function rangesearch(haystack::AbstractRange, needle)
