@@ -1661,37 +1661,61 @@ for fun in (:+, :-)
 end
 
 ### Reduction
-Base.reducedim_initarray(A::SparseVectorUnion, region, v0, ::Type{R}) where {R} =
-    fill!(Array{R}(undef, Base.to_shape(Base.reduced_indices(A, region))), v0)
-
-function Base._mapreduce(f, op, ::IndexCartesian, A::SparseVectorUnion)
-    T = eltype(A)
-    isempty(A) && return Base.mapreduce_empty(f, op, T)
+nzvalview(v::SparseVector) = view(nonzeros(v), 1:nnz(v))
+getnzval(v::SparseVector) = nonzeros(v)
+Base.mapreduce_kernel(f, op, A::SparseVectorUnion, init, inds::CartesianIndices{1}) = Base.mapreduce_kernel(f, op, A, init, inds.indices[1])
+function Base.mapreduce_kernel(f, op::CommutativeOps, A::SparseVectorUnion{T}, init, inds::AbstractUnitRange) where {T}
     z = nnz(A)
-    rest, ini = if z == 0
-        length(A)-z-1, f(zero(T))
-    else
-        length(A)-z, Base.mapreduce_impl(f, op, nonzeros(A), 1, z)
+    n = widelength(A)
+    if z == 0
+        return _mapreducezeros(f, op, T, n-1, Base._mapreduce_start(f, op, A, init, zero(T)))
+    elseif inds == CartesianIndices(A).indices[1]
+        return _mapreducezeros(f, op, T, n-z, mapreduce(f, op, nzvalview(A); init))
     end
-    _mapreducezeros(f, op, T, rest, ini)
+    rows = inds
+    rowval = rowvals(A)
+    nzval = getnzval(A)
+    m = length(rows)
+    r = Base._mapreduce_start(f, op, A, init, A[first(inds)])
+    j1 = searchsortedfirst(rowval, first(rows) + 1)
+    jN = searchsortedlast(@view(rowval[j1:end]), last(rows))
+    for j in j1:j1+jN-1
+        # @info "($(rowval[j]))"
+        r = op(r, f(nzval[j]))
+    end
+    # @info "($(rowval[jN])) $(m-jN-1) zeros intermixed"
+    r = _mapreducezeros(f, op, T, m-jN-1, r)
+    return r
 end
 
-Base._any(f, A::SparseVectorUnion, ::Colon) =
-    iszero(length(A)) ? false : Base._mapreduce(f, |, IndexCartesian(), A)
-Base._all(f, A::SparseVectorUnion, ::Colon) =
-    iszero(length(A)) ? true  : Base._mapreduce(f, &, IndexCartesian(), A)
-
-function Base.mapreducedim!(f, op, R::AbstractVector, A::SparseVectorUnion)
-    isempty(A) && return R
-    # dim1 reduction could be safely replaced with a mapreduce
-    if length(R) == 1
-        I = firstindex(R)
-        v = Base._mapreduce(f, op, IndexCartesian(), A)
-        R[I] = op(R[I], v)
-        return R
+function Base.mapreduce_kernel(f, op, A::SparseVectorUnion{T}, init, inds::AbstractUnitRange) where {T}
+    if nnz(A) == 0
+        n = widelength(A)
+        return _mapreducezeros(f, op, T, n-1, Base._mapreduce_start(f, op, A, init, zero(T)))
     end
-    # otherwise there's no reduction
-    map!((x, y) -> op(x, f(y)), R, R, A)
+    rows = inds
+    rowval = rowvals(A)
+    nzval = getnzval(A)
+    m = length(rows)
+    r = Base._mapreduce_start(f, op, A, init, A[first(inds)])
+    # @info "$inds"
+    j1 = searchsortedfirst(rowval, first(rows) + 1)
+    jN = searchsortedlast(@view(rowval[j1:end]), last(rows))
+    row = first(rows)
+    for j in j1:j1+jN-1
+        row, prev_stored_row = rowval[j], row
+        if row > prev_stored_row+1
+            # @info "($row, $col) $(row-prev_stored_row-1) zeros preceeding"
+            r = _mapreducezeros(f, op, T, row-prev_stored_row-1, r)
+        end
+        # @info "($row, $col)"
+        r = op(r, f(nzval[j]))
+    end
+    if last(rows) > row
+        # @info "($(row),) $(m-jN) zeros following"
+        r = _mapreducezeros(f, op, T, m-jN, r)
+    end
+    return r
 end
 
 for (fun, comp, word) in ((:findmin, :(<), "minimum"), (:findmax, :(>), "maximum"))

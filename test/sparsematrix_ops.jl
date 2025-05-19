@@ -385,7 +385,7 @@ end
         @test m(S, dims=region) == m(A, dims=region)
     end
     for m in [findmax, findmin]
-        @test_throws ArgumentError m(S, (4, 3))
+        @test_throws MethodError m(S, (4, 3)) # TODO?
     end
     S = spzeros(10,8)
     A = Array(S)

@@ -2467,7 +2467,7 @@ function Base.mapreduce_kernel(f, op::CommutativeOps, A::AbstractSparseMatrixCSC
         # @info "(:, $col1) $(m1-(colptr[col1+1]-j1)) zeros intermingled"
         r = _mapreducezeros(f, op, T, m1-(colptr[col1+1]-j1), r)
 
-        for col in cols[begin+1:end]
+        for col in cols[begin+1:end] # TODO: can remove this loop
             for j in colptr[col]:colptr[col+1]-1
                 # @info "($(rowval[j]), $col)"
                 r = op(r, f(nzval[j]))
