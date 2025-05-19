@@ -2436,47 +2436,48 @@ function Base.mapreduce_kernel(f, op::CommutativeOps, A::AbstractSparseMatrixCSC
     colptr = getcolptr(A)
     nzval = getnzval(A)
     m = length(rows)
-    r = Base._mapreduce_start(f, op, A, init, A[first(inds)])
-    # @info "$inds"
-    # @info "$((first(inds).I...,))"
-    if m != size(A, 1)
-        # We need to constrain our column indexing by the given rows
+    if m == 1
+        # In the common case of reducing over just one row we just need to identify
+        # whether that row is stored or not
+        row = only(rows)
+        r = Base._mapreduce_start(f, op, A, init, A[row, first(cols)])
+        nskipped = 0
+        for col in cols[begin+1:end]
+            js = colptr[col]:colptr[col+1]-1
+            j = searchsorted(view(rowval, js), row)
+            if isempty(j)
+                nskipped += 1
+            else
+                r = op(r, f(nzval[js[j[]]]))
+            end
+        end
+        r = _mapreducezeros(f, op, T, nskipped, r)
+        return r
+    elseif m != size(A, 1)
+        # We need to constrain our column indexing by the given rows in every col
+        r = Base._mapreduce_start(f, op, A, init, A[first(inds)])
         for col in cols
             js = colptr[col]:colptr[col+1]-1
             j1 = searchsortedfirst(view(rowval, js), first(rows) + (col == first(cols)))
             jN = searchsortedlast(view(rowval, js[j1:end]), last(rows))
-            for j in js[j1:j1+jN-1]
-                # @info "($(rowval[j]), $col)"
-                r = op(r, f(nzval[j]))
+            if jN > 0
+                r = op(r, mapreduce(f, op, view(nzval, js[j1:j1+jN-1]); init))
             end
-            # @info "($(rowval[js[end]]), $col) $(m-jN-(col==first(cols))) zeros following"
             r = _mapreducezeros(f, op, T, m-jN-(col==first(cols)), r)
         end
+        return r
     else
-        # It's not as easy to skip that first row for the first column; peel it out here:
-        col1 = first(cols)
-        j1 = colptr[col1]
-        m1 = m-1
-        if rowval[j1] == first(rows)
-            j1 += 1
-        end
-        for j in j1:colptr[col1+1]-1
-            # @info "($(rowval[j]), $col1)"
-            r = op(r, f(nzval[j]))
-        end
-        # @info "(:, $col1) $(m1-(colptr[col1+1]-j1)) zeros intermingled"
-        r = _mapreducezeros(f, op, T, m1-(colptr[col1+1]-j1), r)
-
-        for col in cols[begin+1:end] # TODO: can remove this loop
-            for j in colptr[col]:colptr[col+1]-1
-                # @info "($(rowval[j]), $col)"
-                r = op(r, f(nzval[j]))
-            end
-            # @info "(:, $col) $(m-(colptr[col+1]-colptr[col])) zeros intermingled"
-            r = _mapreducezeros(f, op, T, m-(colptr[col+1]-colptr[col]), r)
+        # We can just mapreduce over all the nonzeros; we just need to make sure
+        # there is at least one element to mapreduce over
+        nzinds = colptr[first(cols)]:colptr[last(cols)+1]-1
+        if isempty(nzinds)
+            return _mapreducezeros(f, op, T, length(inds)-1, Base._mapreduce_start(f, op, A, init, zero(T)))
+        else
+            r = mapreduce(f, op, view(nzval, nzinds); init)
+            r = _mapreducezeros(f, op, T, length(inds) - length(nzinds), r)
+            return r
         end
     end
-    return r
 end
 
 function Base.mapreduce_kernel(f, op, A::AbstractSparseMatrixCSC{T}, init, inds::CartesianIndices{2}) where {T}
